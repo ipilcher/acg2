@@ -1,0 +1,5 @@
+/usr/local/bin/acg		system_u:object_r:acg_exec_t:s0
+/etc/acg(/.*)?			system_u:object_r:acg_etc_t:s0
+/var/lib/acg(/.*)?		system_u:object_r:acg_var_lib_t:s0
+/var/www/acme-challenge(/.*)?	system_u:object_r:acg_httpd_content_t:s0
+/run/acg(/.*)?			system_u:object_r:acg_var_run_t:s0

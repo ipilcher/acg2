@@ -1,0 +1,10 @@
+[Unit]
+Description=Timer for ACME Certificate Getter service reloaders
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=900
+Unit=acg-reload.target
+
+[Install]
+WantedBy=timers.target

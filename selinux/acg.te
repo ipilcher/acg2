@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+#
+# Copyright 2023, 2025 Ian Pilcher <arequipeno@gmail.com>
+#
+# ACME Cert Getter - https://github.com/ipilcher/acg
+#
+
+policy_module(acg, 0)
+
+require {
+	type devlog_t;
+	type syslogd_var_run_t;
+	type kernel_t;
+	type httpd_t;
+	type cert_t;
+	type http_port_t;
+	type net_conf_t;
+	type unconfined_t;
+	type user_devpts_t;
+	type NetworkManager_var_run_t;
+	type sysfs_t;
+	type proc_t;
+	type var_run_t;
+	type cgroup_t;
+};
+
+type acg_t;
+type acg_exec_t;
+type acg_etc_t;
+type acg_var_lib_t;
+type acg_httpd_content_t;
+type acg_var_run_t;
+
+init_daemon_domain(acg_t, acg_exec_t)
+files_type(acg_etc_t)
+files_type(acg_var_lib_t)
+files_type(acg_httpd_content_t)
+files_type(acg_var_run_t)
+
+allow unconfined_t acg_t:process2 { nosuid_transition };
+allow init_t acg_t:process2 { nosuid_transition };
+allow init_t acg_t:process2 { nnp_transition };
+allow init_t acg_exec_t:file { unlink };
+
+# syslog
+allow acg_t self:unix_dgram_socket { create connect write };
+allow acg_t kernel_t:unix_dgram_socket { sendto };
+allow acg_t devlog_t:lnk_file { read };
+allow acg_t devlog_t:sock_file { write };
+allow acg_t syslogd_var_run_t:dir { search };
+
+# stderr
+allow acg_t user_devpts_t:chr_file { read write append };
+
+# pyca/cryptography uses cgroup info to determine how many threads to use
+allow acg_t cgroup_t:dir { search };
+
+# config files (/etc/acg)
+allow acg_t acg_etc_t:dir { search };
+allow acg_t acg_etc_t:lnk_file { read };
+allow acg_t acg_etc_t:file { read open getattr map };
+
+# state directory (/var/lib/acg)
+allow acg_t acg_var_lib_t:dir { search write add_name remove_name getattr };
+allow acg_t acg_var_lib_t:file { read open getattr create write setattr };
+
+# ACME challenge directory (/var/www/acme-challenge)
+allow acg_t acg_httpd_content_t:dir { search write add_name remove_name };
+allow acg_t acg_httpd_content_t:file { create write open getattr unlink };
+allow httpd_t acg_httpd_content_t:file { getattr read open };
+
+# /etc/hosts (may be symlink) and DNS queries
+allow acg_t net_conf_t:lnk_file { read };
+allow acg_t NetworkManager_var_run_t:dir { search };
+allow acg_t net_conf_t:file { getattr open read };
+allow acg_t self:udp_socket { create connect write read getattr setopt };
+
+# communication with letsencrypt.org
+allow acg_t self:tcp_socket { create setopt connect getattr getopt write read };
+allow acg_t http_port_t:tcp_socket { name_connect };
+
+# system trusted CAs (and OpenSSL configuration)
+allow acg_t cert_t:dir { search getattr read open };
+allow acg_t cert_t:lnk_file { read };
+allow acg_t cert_t:file { read open getattr };
+
+# reload flags & lock file (/run/acg)
+allow acg_t acg_var_run_t:dir { search write add_name };
+allow acg_t acg_var_run_t:file { create append open getattr write lock };
+
+# dontaudit rules (gotta love Python libraries!)
+dontaudit acg_t sysfs_t:file { read };
+dontaudit acg_t proc_t:file { read };
+dontaudit acg_t self:tcp_socket { bind };
+dontaudit acg_t acg_var_lib_t:file { ioctl };
+dontaudit acg_t acg_etc_t:file { ioctl };
+dontaudit acg_t acg_httpd_content_t:file { ioctl };
+dontaudit acg_t acg_var_run_t:file { ioctl };

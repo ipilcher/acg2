@@ -1,0 +1,6 @@
+/selinux/acg.if
+/selinux/cfm.if
+/selinux/tmp/**
+/selinux/acg.pp
+/selinux/cfm.pp
+/acg-cfm

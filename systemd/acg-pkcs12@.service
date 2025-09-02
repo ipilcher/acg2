@@ -1,0 +1,16 @@
+[Unit]
+Description=ACME Certificate Getter for %I (PKCS#12 format)
+
+[Service]
+Type=oneshot
+PrivateTmp=true
+ExecStartPre=/usr/bin/cp /usr/bin/python3 /tmp/python.acg
+ExecStartPre=/usr/bin/chcon --reference=/usr/local/bin/acg /tmp/python.acg
+ExecStart=/tmp/python.acg /usr/local/bin/acg -d -l -p --production %i
+# Restart the service if it times out waiting for the lock
+RestartForceExitStatus=75
+User=acg
+Group=acg
+
+[Install]
+WantedBy=acg.target

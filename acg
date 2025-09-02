@@ -1,0 +1,504 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+#
+# Copyright 2023, 2024, 2025 Ian Pilcher <arequipeno@gmail.com>
+#
+# ACME Cert Getter - https://github.com/ipilcher/acg
+#
+
+import argparse
+import base64
+import datetime
+import errno
+import fcntl
+import logging
+import logging.handlers
+import os
+import sys
+import time
+import typing
+
+import acme.challenges
+import acme.client
+import acme.messages
+import josepy.jwk
+
+import cryptography.hazmat.primitives.asymmetric.rsa as rsa
+import cryptography.hazmat.primitives.hashes as hashes
+import cryptography.hazmat.primitives.serialization as s11n
+import cryptography.hazmat.primitives.serialization.pkcs12 as pkcs12
+import cryptography.x509 as x509
+
+
+CONFIG_DIR = '/etc/acg'
+STATE_DIR = '/var/lib/acg'
+CHALLENGE_DIR = '/var/www/acme-challenge'
+
+FLOCK_INTERVAL = 10
+FLOCK_ATTEMPTS = 30
+
+LE_URLS = [
+    # production == False (0)
+    'https://acme-staging-v02.api.letsencrypt.org/directory',
+    # production == True (1)
+    'https://acme-v02.api.letsencrypt.org/directory'
+]
+
+CRMF_EXT_REQ_OID = x509.ObjectIdentifier('1.2.840.113549.1.9.14')
+
+LOGGER = logging.getLogger(__name__)
+
+
+#
+#    Parse command-line arguments
+#
+
+def parse_args() -> argparse.Namespace:
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--production', help="use Let's Encrypt production environment",
+        action='store_true'
+    )
+    parser.add_argument(
+        '--lock-debug', help='acquire lock and sleep indefinitely',
+        action='store_true'
+    )
+    parser.add_argument(
+        '-d', '--debug', help='log debugging messages', action='store_true'
+    )
+    parser.add_argument(
+        '-t', '--tty', help='log to terminal (stderr) instead of syslog',
+        action='store_true'
+    )
+    parser.add_argument(
+        '-f', '--force', help='force refresh (ignore existing certificate)',
+        action='store_true'
+    )
+    parser.add_argument(
+        '-p', '--pkcs12', help='create PKCS#12 file (in addition to PEM files)',
+        action='store_true'
+    )
+    parser.add_argument(
+        '-l', '--lock', help='acquire lock before doing anything',
+        action='store_true'
+    )
+    parser.add_argument(
+        'spec', help='the certificate to be updated ([service:]hostname)'
+    )
+    return parser.parse_args()
+
+
+#
+#    Set up logging
+#
+
+def logging_init(args: argparse.Namespace) -> None:
+
+    LOGGER.setLevel(logging.DEBUG if args.debug else logging.INFO)
+    LOGGER.propagate = False
+
+    if args.tty:
+        LOGGER.addHandler(logging.StreamHandler())
+    else:
+        LOGGER.addHandler(logging.handlers.SysLogHandler(address='/dev/log'))
+
+    LOGGER.debug(f'Logging to {"STDERR" if args.tty else "SYSLOG"}')
+
+
+#
+#    Check expiration of existing certificate
+#
+
+def check_cert_life(spec: str, min_days: int) -> None:
+
+    cert_filename = f'{STATE_DIR}/{spec}.crt'
+
+    try:
+        with open(cert_filename, 'rb') as cert_file:
+            # This works because the server cert is always first in the PEM file
+            cert = x509.load_pem_x509_certificate(cert_file.read())
+    except EnvironmentError as e:
+        if e.errno == errno.ENOENT:
+            LOGGER.info(f'No existing certificate found for {spec}')
+            return
+        else:
+            raise
+
+    cert_life = cert.not_valid_after_utc - datetime.datetime.now(datetime.UTC)
+
+    if cert_life > datetime.timedelta(days=min_days):
+        LOGGER.info(
+            f'Certificate for {spec} has {cert_life.days} days remaining'
+        )
+        LOGGER.info('Nothing to do; exiting')
+        sys.exit(0)
+
+    LOGGER.debug(
+        f'Certificate for {spec} has {cert_life.days} days remaining'
+    )
+
+
+#
+#    Load the Let's Encrypt client key
+#
+
+def load_client_key(spec: str) -> josepy.jwk.JWKRSA:
+
+    key_filename = f'{CONFIG_DIR}/private/{spec}-acme-client.key'
+
+    with open(key_filename, 'rb') as key_file:
+        key_pem = key_file.read()
+
+    rsakey = s11n.load_pem_private_key(key_pem, None)
+    jwk = josepy.jwk.JWKRSA(key=rsakey)
+    LOGGER.debug(f'Loaded client key from {key_filename}')
+    return jwk
+
+
+#
+#    Load or retrieve the account URI
+#
+
+def get_account_uri(jwk: josepy.jwk.JWK, spec: str, production: bool) -> str:
+
+    if production:
+        uri_filename = f'{STATE_DIR}/{spec}-account'
+    else:
+        uri_filename = f'{STATE_DIR}/{spec}-staging-account'
+
+    try:
+        with open(uri_filename, 'r') as uri_file:
+            uri = uri_file.read()
+            LOGGER.debug(f'Loaded account URI from {uri_filename}')
+            return uri
+    except EnvironmentError as e:
+        if e.errno != errno.ENOENT:
+            raise
+
+    LOGGER.debug(f'Account URI cache ({uri_filename}) not present')
+
+    # https://community.letsencrypt.org/t/acme-python-clientv2-not-able-to-renew-a-certificate-without-enrolling-new-account/103452/3
+    reg = acme.messages.NewRegistration(
+        key=jwk.public_key(), only_return_existing=True
+    )
+    net = acme.client.ClientNetwork(jwk)
+    directory = acme.messages.Directory.from_json(
+        net.get(LE_URLS[production]).json()
+    )
+    client = acme.client.ClientV2(directory, net)
+    regr = client._regr_from_response(
+        client._post(directory['newAccount'], reg)
+    )
+
+    LOGGER.debug(f'Got account URI: {regr.uri}')
+
+    with open(uri_filename, 'w') as uri_file:
+        uri_file.write(regr.uri)
+
+    LOGGER.debug(f'Cached account URI at {uri_filename}')
+
+    return regr.uri
+
+
+#
+#    Create an ACME client
+#
+
+def create_client(
+    jwk: josepy.jwk.JWK, acct_uri: str, production: bool
+) -> (
+    acme.client.ClientV2
+):
+
+    client_net = acme.client.ClientNetwork(
+        jwk, account=acme.messages.RegistrationResource(uri=acct_uri)
+    )
+    directory = acme.messages.Directory.from_json(
+        client_net.get(LE_URLS[production]).json()
+    )
+    return acme.client.ClientV2(directory, net=client_net)
+
+
+#
+#    Load the "template" CSR and create a CSR signed by the new key
+#
+
+def load_csr(
+    spec: str, key: rsa.RSAPrivateKey
+) -> (
+    x509.CertificateSigningRequest
+):
+
+    csr_filename = f'{CONFIG_DIR}/{spec}.csr'
+
+    with open(csr_filename, 'rb') as csr_file:
+        csr = x509.load_pem_x509_csr(csr_file.read())
+
+    LOGGER.debug(f'Loaded CSR for {spec} from {csr_filename}')
+
+    csrb = x509.CertificateSigningRequestBuilder()
+    csrb = csrb.subject_name(csr.subject)
+
+    for attr in csr.attributes:
+        # Skip the extension request attribute
+        if attr.oid == CRMF_EXT_REQ_OID:
+            continue
+        try:
+            atype = x509.name._ASN1Type(attr._type)
+        except ValueError:
+            LOGGER.warning(
+                'Skipping attribute with unsupported type: '
+                f'oid={attr.oid}, type={attr._type}'
+            )
+            continue
+        csrb = csrb.add_attribute(attr.oid, attr.value, _tag=atype)
+
+    for ext in csr.extensions:
+        csrb = csrb.add_extension(ext.value, ext.critical)
+
+    return csrb.sign(key, hashes.SHA256())
+
+
+#
+#    Find the HTTP-01 challenge in an order
+#
+
+def get_http01_challenge(
+    order: acme.messages.OrderResource
+) -> (
+    acme.messages.ChallengeBody
+):
+
+    for authr in order.authorizations:
+        for challenge in authr.body.challenges:
+            if isinstance(challenge.chall, acme.challenges.HTTP01):
+                return challenge
+
+    raise Exception('ACME server did not offer HTTP-01 challenge')
+
+
+#
+#   Does cert have a SubjectAlternativeName that matches dnsname?
+#
+
+def cert_has_dnsname(cert: x509.Certificate, dnsname: str) -> bool:
+    try:
+        sans = cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName
+        )
+    except x509.ExtensionNotFound:
+        return False
+    return dnsname in sans.value.get_values_for_type(x509.DNSName)
+
+
+#
+#   Sort a certificate chain into its proper order
+#
+
+def sort_cert_chain(
+    chain: list[x509.Certificate], hostname: str
+) -> (
+    list[x509.Certificate]
+):
+    intermediate_certs = {}
+    server_cert = None
+    for cert in chain:
+        if cert_has_dnsname(cert, hostname):
+            server_cert = cert
+        else:
+            intermediate_certs[cert.subject] = cert
+    assert server_cert is not None, "Didn't receive server certificate"
+    cert = server_cert
+    new_chain = [cert]
+    while intermediate_certs:
+        issuer = intermediate_certs.pop(cert.issuer)
+        cert.verify_directly_issued_by(issuer)
+        new_chain.append(issuer)
+        cert = issuer
+    return new_chain
+
+
+#
+#    Execute the challenge
+#
+
+def execute_challenge(
+    client: acme.client.ClientV2, csr: x509.CertificateSigningRequest,
+    hostname: str, spec: str
+) -> (
+    list[x509.Certificate]
+):
+
+    order = client.new_order(csr.public_bytes(s11n.Encoding.PEM))
+    challenge = get_http01_challenge(order)
+    response, validation = challenge.response_and_validation(client.net.key)
+
+    validation_filename = f'{CHALLENGE_DIR}/{challenge.path.split('/')[-1]}'
+
+    with open(validation_filename, 'w') as validation_file:
+        validation_file.write(validation)
+
+    LOGGER.debug(f'Wrote validation file to {validation_filename}')
+
+    client.answer_challenge(challenge, response)
+    order = client.poll_and_finalize(order)
+
+    if order.body.status != acme.messages.STATUS_VALID:
+        raise Exception(f'Order status ({order.body.status.name} is not VALID')
+
+    LOGGER.debug('Got VALID order from ACME server')
+
+    os.remove(validation_filename)
+
+    LOGGER.debug(f'Removed validation file ({validation_filename})')
+
+    chain = x509.load_pem_x509_certificates(order.fullchain_pem.encode('ascii'))
+    chain = sort_cert_chain(chain, hostname)
+
+    LOGGER.debug(f'Got certificate chain for {spec}')
+
+    return chain
+
+
+#
+#    Write the new certificate chain as a PEM file
+#
+
+def write_chain_pem(chain: list[x509.Certificate], spec: str) -> None:
+
+    chain_filename = f'{STATE_DIR}/{spec}.crt'
+
+    with open(chain_filename, 'wb') as chain_file:
+        for cert in chain:
+            chain_file.write(cert.public_bytes(s11n.Encoding.PEM))
+
+    LOGGER.info(f'Wrote new certificate chain for {spec} to {chain_filename}')
+    LOGGER.info(
+        'New certificate valid until '
+        f'{chain[0].not_valid_after_utc:%Y-%m-%d %H:%M:%S %Z}'
+    )
+
+
+#
+#   Write the new certificate chain (and its key) as a PKCS#12 file
+#
+
+def write_cert_pkcs12(
+    chain: list[x509.Certificate], key: rsa.RSAPrivateKey, spec: str
+) -> (
+    None
+):
+
+    spec_bytes = spec.encode('utf-8')
+    p12 = pkcs12.serialize_key_and_certificates(
+        spec_bytes, key, chain[0], chain[1:],
+        s11n.BestAvailableEncryption(spec_bytes)
+    )
+
+    p12_filename = f'{STATE_DIR}/private/{spec}.p12'
+    with open(p12_filename, 'wb') as p12_file:
+        os.fchmod(p12_file.fileno(), 0o600)
+        p12_file.write(p12)
+    LOGGER.info(f'Wrote new PKCS#12 file for {spec} to {p12_filename}')
+
+
+#
+#   Save the new private key
+#
+
+def write_key(key: rsa.RSAPrivateKey, spec: str) -> None:
+
+    key_filename = f'{STATE_DIR}/private/{spec}.key'
+
+    with open(key_filename, 'wb') as key_file:
+        os.fchmod(key_file.fileno(), 0o600)
+        key_file.write(key.private_bytes(
+            s11n.Encoding.PEM, s11n.PrivateFormat.PKCS8, s11n.NoEncryption()
+        ))
+    LOGGER.info(f'Wrote new private key for {spec} to {key_filename}')
+
+
+#
+#   Lock the lock file (or exit)
+#
+
+def get_flock() -> typing.TextIO:
+
+    lock_file = open('/run/acg/lock', 'w')
+    a = FLOCK_ATTEMPTS
+
+    while True:
+        a -= 1
+        LOGGER.debug('Attempting to acquire file lock: /run/acg/lock')
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if a > 0:
+                LOGGER.debug(
+                    f'Failed to acquire lock; waiting {FLOCK_INTERVAL} seconds'
+                )
+                time.sleep(FLOCK_INTERVAL)
+                continue
+            else:
+                LOGGER.error(
+                    'Failed to acquire file lock after '
+                    f'{FLOCK_ATTEMPTS} attempts: /run/acg/lock'
+                )
+                sys.exit(75)  # BSD EX_TEMPFAIL
+        LOGGER.info('Acquired file lock: /run/acg/lock')
+        return lock_file
+
+
+def main() -> None:
+
+    args = parse_args()
+    logging_init(args)
+
+    spec = args.spec.split(':', maxsplit=1)
+    if len(spec) == 2:
+        service = spec[0]
+        hostname = spec[1]
+    else:
+        service = None
+        hostname = spec[0]
+
+    if args.lock_debug:
+        lock_file = get_flock()
+        LOGGER.info('Sleeping for 1 hour')
+        while True:
+            time.sleep(3600)
+
+    if not args.force:
+        check_cert_life(args.spec, 30)
+
+    if args.lock:
+        lock_file = get_flock()
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    csr = load_csr(args.spec, key)
+    client_key = load_client_key(args.spec)
+    acct_uri = get_account_uri(client_key, args.spec, args.production)
+    client = create_client(client_key, acct_uri, args.production)
+    chain = execute_challenge(client, csr, hostname, args.spec)
+
+    if args.pkcs12:
+        write_cert_pkcs12(chain, key, args.spec)
+
+    write_key(key, args.spec)
+    write_chain_pem(chain, args.spec)
+
+    if service is not None:
+        flag_file_name = f'/run/acg/{service}-reload'
+        open(flag_file_name, 'a')
+        LOGGER.info(f'Wrote service reload flag file: {flag_file_name}')
+
+    LOGGER.info('Great success!')
+
+
+if __name__ == '__main__':
+    main()
+
+
+# kate: indent-width 4; replace-tabs on;

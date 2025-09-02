@@ -1,0 +1,51 @@
+[Unit]
+Description=ACME Certificate Getter - cert file mover for %I
+ConditionPathExists=/run/acg/%I-reload
+
+[Service]
+Type=oneshot
+User=acg-cfm
+Group=acg-cfm
+PrivateTmp=true
+PrivateDevices=true
+PrivateUsers=identity
+ProtectSystem=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectProc=noaccess
+ProcSubset=pid
+UMask=0777
+RestrictNamespaces=true
+LockPersonality=true
+NoNewPrivileges=true
+ProtectKernelModules=true
+SystemCallArchitectures=native
+ProtectHostname=true
+# systemctl uses a UNIX socket to communicate with systemd
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectClock=true
+RemoveIPC=true
+MemoryDenyWriteExecute=true
+PrivateNetwork=true
+IPAddressDeny=any
+SystemCallFilter=@system-service
+SystemCallFilter=~@resources
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID
+ExecStart=/usr/local/bin/acg-cfm /etc/acg/cfm/%I.conf
+ExecStart=/usr/bin/systemctl reload-or-restart %I.service
+ExecStart=/usr/bin/rm /run/acg/%I-reload
+
+#
+# These break the service
+#
+#DynamicUser=true
+#SecureBits=keep-caps
+# See https://github.com/systemd/systemd/issues/38711
+#RestrictSUIDSGID=true
+
+[Install]
+WantedBy=acg-reload.target
