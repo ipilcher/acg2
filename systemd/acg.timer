@@ -1,3 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+#
+#	Copyright 2025 Ian Pilcher <arequipeno@gmail.com>
+#
+#	ACME Cert Getter v2 - https://github.com/ipilcher/acg2
+#
+
 [Unit]
 Description=Timer for ACME Certificate Getter
 
