@@ -1,5 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+#
+# Copyright 2023, 2025 Ian Pilcher <arequipeno@gmail.com>
+#
+# ACME Cert Getter v2 - https://github.com/ipilcher/acg2
+#
+
+# ACME Certificate Getter (/usr/local/bin/acg)
 /usr/local/bin/acg		system_u:object_r:acg_exec_t:s0
 /etc/acg(/.*)?			system_u:object_r:acg_etc_t:s0
 /var/lib/acg(/.*)?		system_u:object_r:acg_var_lib_t:s0
 /var/www/acme-challenge(/.*)?	system_u:object_r:acg_httpd_content_t:s0
 /run/acg(/.*)?			system_u:object_r:acg_var_run_t:s0
+
+# Certificate File Mover (/usr/local/bin/acg-cfm)
+/etc/acg/cfm(/.*)?	system_u:object_r:cfm_etc_t:s0
+/usr/local/bin/acg-cfm	system_u:object_r:cfm_exec_t:s0
