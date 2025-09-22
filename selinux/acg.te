@@ -81,7 +81,7 @@ allow acg_t acg_var_lib_t:file { read open getattr create write setattr };
 # ACME challenge directory (/var/www/acme-challenge)
 allow acg_t acg_httpd_content_t:dir { search write add_name remove_name };
 allow acg_t acg_httpd_content_t:file { create write open getattr unlink };
-allow httpd_t acg_httpd_content_t:file { getattr read open };
+allow httpd_t acg_httpd_content_t:file { getattr read open map };
 
 # /etc/hosts (may be symlink) and DNS queries
 allow acg_t net_conf_t:lnk_file { read };
